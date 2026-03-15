@@ -1,19 +1,45 @@
 import type { GraphQLClient } from "graphql-request";
-import { gql } from "graphql-request";
 import { z } from "zod";
-import { handleToolError, edgesToNodes } from "../lib/toolUtils.js";
+import { handleToolError, edgesToNodes, buildFieldSelection } from "../lib/toolUtils.js";
+
+/** Map of selectable field names → GraphQL fragments for customers */
+const CUSTOMER_FIELD_MAP: Record<string, string> = {
+  id: "id",
+  firstName: "firstName",
+  lastName: "lastName",
+  email: "defaultEmailAddress { emailAddress }",
+  phone: "defaultPhoneNumber { phoneNumber }",
+  createdAt: "createdAt",
+  updatedAt: "updatedAt",
+  tags: "tags",
+  defaultAddress: "defaultAddress { address1 address2 city provinceCode zip country phone }",
+  addresses: "addressesV2(first: 10) { edges { node { address1 address2 city provinceCode zip country phone } } }",
+  amountSpent: "amountSpent { amount currencyCode }",
+  numberOfOrders: "numberOfOrders",
+};
+
+const AVAILABLE_CUSTOMER_FIELDS = Object.keys(CUSTOMER_FIELD_MAP) as [string, ...string[]];
 
 // Input schema for getCustomers
 const GetCustomersInputSchema = z.object({
   searchQuery: z.string().optional().describe("Freetext search or Shopify query syntax (e.g. 'country:US tag:vip orders_count:>5')"),
-  limit: z.number().default(10),
+  limit: z.number().min(1).max(250).default(10)
+    .describe("Number of customers to return (default 10, max 250)"),
   after: z.string().optional().describe("Cursor for forward pagination"),
   before: z.string().optional().describe("Cursor for backward pagination"),
   sortKey: z.enum([
     "CREATED_AT", "ID", "LAST_UPDATE", "LOCATION", "NAME",
     "ORDERS_COUNT", "RELEVANCE", "TOTAL_SPENT", "UPDATED_AT"
   ]).optional().describe("Sort key for customers"),
-  reverse: z.boolean().optional().describe("Reverse the sort order")
+  reverse: z.boolean().optional().describe("Reverse the sort order"),
+  fields: z
+    .array(z.enum(AVAILABLE_CUSTOMER_FIELDS))
+    .optional()
+    .describe(
+      "Select which fields to return to reduce response size. " +
+      "When omitted, all fields are returned. Always includes 'id'. " +
+      `Available: ${AVAILABLE_CUSTOMER_FIELDS.join(", ")}`,
+    ),
 });
 
 type GetCustomersInput = z.infer<typeof GetCustomersInputSchema>;
@@ -23,7 +49,7 @@ let shopifyClient: GraphQLClient;
 
 const getCustomers = {
   name: "get-customers",
-  description: "Get customers or search by name/email",
+  description: "Get customers or search by name/email. Supports field selection via 'fields' to reduce response size (e.g. fields: [\"id\", \"email\"] for minimal data).",
   schema: GetCustomersInputSchema,
 
   // Add initialize method to set up the GraphQL client
@@ -33,52 +59,16 @@ const getCustomers = {
 
   execute: async (input: GetCustomersInput) => {
     try {
-      const { searchQuery, limit, after, before, sortKey, reverse } = input;
+      const { searchQuery, limit, after, before, sortKey, reverse, fields } = input;
 
-      const query = gql`
+      const fieldSelection = buildFieldSelection(CUSTOMER_FIELD_MAP, fields);
+
+      const query = `
         query GetCustomers($first: Int!, $query: String, $after: String, $before: String, $sortKey: CustomerSortKeys, $reverse: Boolean) {
           customers(first: $first, query: $query, after: $after, before: $before, sortKey: $sortKey, reverse: $reverse) {
             edges {
               node {
-                id
-                firstName
-                lastName
-                defaultEmailAddress {
-                  emailAddress
-                }
-                defaultPhoneNumber {
-                  phoneNumber
-                }
-                createdAt
-                updatedAt
-                tags
-                defaultAddress {
-                  address1
-                  address2
-                  city
-                  provinceCode
-                  zip
-                  country
-                  phone
-                }
-                addressesV2(first: 10) {
-                  edges {
-                    node {
-                      address1
-                      address2
-                      city
-                      provinceCode
-                      zip
-                      country
-                      phone
-                    }
-                  }
-                }
-                amountSpent {
-                  amount
-                  currencyCode
-                }
-                numberOfOrders
+                ${fieldSelection}
               }
             }
             pageInfo {
@@ -104,7 +94,16 @@ const getCustomers = {
         customers: any;
       };
 
-      // Extract and format customer data
+      // When custom fields are specified, return raw nodes
+      if (fields) {
+        const customers = data.customers.edges.map((edge: any) => edge.node);
+        return {
+          customers,
+          pageInfo: data.customers.pageInfo
+        };
+      }
+
+      // Default: full formatting
       const customers = data.customers.edges.map((edge: any) => {
         const customer = edge.node;
 
