@@ -36,8 +36,10 @@ const GetProductsInputSchema = z.object({
     .array(z.enum(AVAILABLE_PRODUCT_FIELDS))
     .optional()
     .describe(
-      "Select which fields to return to reduce response size. " +
-      "When omitted, all fields are returned. Always includes 'id'. " +
+      "IMPORTANT: Always specify this to minimize token usage and avoid flooding context with unnecessary data. " +
+      "Only the listed fields will be fetched from the API and returned. 'id' is always included. " +
+      "If you are unsure which fields are needed, ask the user before fetching all fields. " +
+      "Example: [\"id\", \"title\"] returns only product GID and title. " +
       `Available: ${AVAILABLE_PRODUCT_FIELDS.join(", ")}`,
     ),
 });
