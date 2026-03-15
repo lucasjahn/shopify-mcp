@@ -1,11 +1,44 @@
 import type { GraphQLClient } from "graphql-request";
-import { gql } from "graphql-request";
 import { z } from "zod";
-import { handleToolError } from "../lib/toolUtils.js";
+import { handleToolError, edgesToNodes, buildFieldSelection } from "../lib/toolUtils.js";
+
+/** Map of selectable field names → GraphQL fragments for product-by-id */
+const PRODUCT_BY_ID_FIELD_MAP: Record<string, string> = {
+  id: "id",
+  title: "title",
+  description: "description",
+  descriptionHtml: "descriptionHtml",
+  handle: "handle",
+  status: "status",
+  createdAt: "createdAt",
+  updatedAt: "updatedAt",
+  totalInventory: "totalInventory",
+  priceRange: "priceRangeV2 { minVariantPrice { amount currencyCode } maxVariantPrice { amount currencyCode } }",
+  media: "media(first: 5) { edges { node { ... on MediaImage { id image { url altText width height } } } } }",
+  variants: "variants(first: 20) { edges { node { id title price inventoryQuantity sku selectedOptions { name value } } } }",
+  collections: "collections(first: 5) { edges { node { id title } } }",
+  seo: "seo { title description }",
+  options: "options { id name position optionValues { id name } }",
+  tags: "tags",
+  vendor: "vendor",
+  productType: "productType",
+};
+
+const AVAILABLE_PRODUCT_BY_ID_FIELDS = Object.keys(PRODUCT_BY_ID_FIELD_MAP) as [string, ...string[]];
 
 // Input schema for getProductById
 const GetProductByIdInputSchema = z.object({
-  productId: z.string().min(1)
+  productId: z.string().min(1).describe("The product ID (e.g. gid://shopify/Product/123 or just 123)"),
+  fields: z
+    .array(z.enum(AVAILABLE_PRODUCT_BY_ID_FIELDS))
+    .optional()
+    .describe(
+      "IMPORTANT: Always specify this to minimize token usage and avoid flooding context with unnecessary data. " +
+      "Only the listed fields will be fetched from the API and returned. 'id' is always included. " +
+      "If you are unsure which fields are needed, ask the user before fetching all fields. " +
+      "Example: [\"id\", \"title\"] returns only GID and title. " +
+      `Available: ${AVAILABLE_PRODUCT_BY_ID_FIELDS.join(", ")}`,
+    ),
 });
 
 type GetProductByIdInput = z.infer<typeof GetProductByIdInputSchema>;
@@ -15,7 +48,7 @@ let shopifyClient: GraphQLClient;
 
 const getProductById = {
   name: "get-product-by-id",
-  description: "Get a specific product by ID",
+  description: "Get a specific product by ID. Supports field selection via 'fields' to reduce response size.",
   schema: GetProductByIdInputSchema,
 
   // Add initialize method to set up the GraphQL client
@@ -25,84 +58,14 @@ const getProductById = {
 
   execute: async (input: GetProductByIdInput) => {
     try {
-      const { productId } = input;
+      const { productId, fields } = input;
 
-      const query = gql`
+      const fieldSelection = buildFieldSelection(PRODUCT_BY_ID_FIELD_MAP, fields);
+
+      const query = `
         query GetProductById($id: ID!) {
           product(id: $id) {
-            id
-            title
-            description
-            handle
-            status
-            createdAt
-            updatedAt
-            totalInventory
-            priceRangeV2 {
-              minVariantPrice {
-                amount
-                currencyCode
-              }
-              maxVariantPrice {
-                amount
-                currencyCode
-              }
-            }
-            media(first: 5) {
-              edges {
-                node {
-                  ... on MediaImage {
-                    id
-                    image {
-                      url
-                      altText
-                      width
-                      height
-                    }
-                  }
-                }
-              }
-            }
-            variants(first: 20) {
-              edges {
-                node {
-                  id
-                  title
-                  price
-                  inventoryQuantity
-                  sku
-                  selectedOptions {
-                    name
-                    value
-                  }
-                }
-              }
-            }
-            collections(first: 5) {
-              edges {
-                node {
-                  id
-                  title
-                }
-              }
-            }
-            tags
-            vendor
-            productType
-            descriptionHtml
-            seo {
-              title
-              description
-            }
-            options {
-              id
-              name
-              position
-              optionValues {
-                id
-                name
-              }
-            }
+            ${fieldSelection}
           }
         }
       `;
@@ -119,9 +82,24 @@ const getProductById = {
         throw new Error(`Product with ID ${productId} not found`);
       }
 
-      // Format product data
       const product = data.product;
 
+      // When custom fields are specified, return raw nodes (run edgesToNodes on connection fields)
+      if (fields) {
+        const result: any = { ...product };
+        if (result.media) {
+          result.media = edgesToNodes(result.media);
+        }
+        if (result.variants) {
+          result.variants = edgesToNodes(result.variants);
+        }
+        if (result.collections) {
+          result.collections = edgesToNodes(result.collections);
+        }
+        return { product: result };
+      }
+
+      // Default: full formatting
       // Format variants
       const variants = product.variants.edges.map((variantEdge: any) => ({
         id: variantEdge.node.id,

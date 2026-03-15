@@ -24,9 +24,17 @@ const AVAILABLE_ORDER_FIELDS = Object.keys(ORDER_FIELD_MAP) as [string, ...strin
 
 // Input schema for getting customer orders
 const GetCustomerOrdersInputSchema = z.object({
-  customerId: z.string().regex(/^\d+$/, "Customer ID must be numeric"),
+  customerId: z.string().regex(/^\d+$/, "Customer ID must be numeric").describe("Numeric customer ID (e.g. 7832529321). Do not pass a full GID."),
   limit: z.number().min(1).max(250).default(10)
     .describe("Number of orders to return (default 10, max 250)"),
+  countOnly: z
+    .boolean()
+    .optional()
+    .describe(
+      "IMPORTANT: Use this to check result set size before fetching data. " +
+      "Returns only { count: N } without any resource data, saving significant context. " +
+      "Recommended before paginating large result sets.",
+    ),
   after: z.string().optional().describe("Cursor for forward pagination"),
   before: z.string().optional().describe("Cursor for backward pagination"),
   sortKey: z.enum([
@@ -64,7 +72,20 @@ const getCustomerOrders = {
 
   execute: async (input: GetCustomerOrdersInput) => {
     try {
-      const { customerId, limit, after, before, sortKey, reverse, fields } = input;
+      const { customerId, limit, after, before, sortKey, reverse, fields, countOnly } = input;
+
+      // Count-only mode: return just the count
+      if (countOnly) {
+        const countQuery = `
+          query GetCustomerOrdersCount($query: String) {
+            ordersCount(query: $query) { count }
+          }
+        `;
+        const countData = (await shopifyClient.request(countQuery, { query: `customer_id:${customerId}` })) as {
+          ordersCount: { count: number };
+        };
+        return { count: countData.ordersCount.count };
+      }
 
       const fieldSelection = buildFieldSelection(ORDER_FIELD_MAP, fields);
 
@@ -100,10 +121,22 @@ const getCustomerOrders = {
         orders: ShopifyConnection<any>;
       };
 
-      // When custom fields are specified, return raw nodes (formatter expects all fields)
-      const orders = fields
-        ? edgesToNodes(data.orders)
-        : edgesToNodes(data.orders).map(formatOrderSummary);
+      // When custom fields are specified, return raw nodes with connection sub-fields flattened
+      if (fields) {
+        const orders = edgesToNodes(data.orders).map((order: any) => {
+          const result: any = { ...order };
+          if (result.lineItems) {
+            result.lineItems = edgesToNodes(result.lineItems);
+          }
+          return result;
+        });
+        return {
+          orders,
+          pageInfo: data.orders.pageInfo
+        };
+      }
+
+      const orders = edgesToNodes(data.orders).map(formatOrderSummary);
 
       return {
         orders,

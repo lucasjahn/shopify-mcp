@@ -47,6 +47,14 @@ const GetOrdersInputSchema = z.object({
       "Example: [\"id\", \"name\"] returns only order GID and order number. " +
       `Available: ${AVAILABLE_ORDER_FIELDS.join(", ")}`,
     ),
+  countOnly: z
+    .boolean()
+    .optional()
+    .describe(
+      "IMPORTANT: Use this to check result set size before fetching data. " +
+      "Returns only { count: N } without any resource data, saving significant context. " +
+      "Recommended before paginating large result sets.",
+    ),
 });
 
 type GetOrdersInput = z.infer<typeof GetOrdersInputSchema>;
@@ -56,7 +64,7 @@ let shopifyClient: GraphQLClient;
 
 const getOrders = {
   name: "get-orders",
-  description: "Get orders with optional filtering by status. Supports field selection via 'fields' to reduce response size (e.g. fields: [\"id\", \"name\"] for minimal data).",
+  description: "Get orders with optional filtering by status. Supports field selection via 'fields' and 'countOnly' to get just the count.",
   schema: GetOrdersInputSchema,
 
   // Add initialize method to set up the GraphQL client
@@ -66,7 +74,7 @@ const getOrders = {
 
   execute: async (input: GetOrdersInput) => {
     try {
-      const { status, limit, after, before, sortKey, reverse, query: rawQuery, fields } = input;
+      const { status, limit, after, before, sortKey, reverse, query: rawQuery, fields, countOnly } = input;
 
       // Build query filters
       const queryParts: string[] = [];
@@ -77,6 +85,19 @@ const getOrders = {
         queryParts.push(rawQuery);
       }
       const queryFilter = queryParts.join(" ") || undefined;
+
+      // Count-only mode: return just the count
+      if (countOnly) {
+        const countQuery = `
+          query GetOrdersCount($query: String) {
+            ordersCount(query: $query) { count }
+          }
+        `;
+        const countData = (await shopifyClient.request(countQuery, { query: queryFilter })) as {
+          ordersCount: { count: number };
+        };
+        return { count: countData.ordersCount.count };
+      }
 
       const fieldSelection = buildFieldSelection(ORDER_FIELD_MAP, fields);
 
@@ -111,10 +132,22 @@ const getOrders = {
         orders: ShopifyConnection<any>;
       };
 
-      // When custom fields are specified, return raw nodes (formatter expects all fields)
-      const orders = fields
-        ? edgesToNodes(data.orders)
-        : edgesToNodes(data.orders).map(formatOrderSummary);
+      // When custom fields are specified, return raw nodes with connection sub-fields flattened
+      if (fields) {
+        const orders = edgesToNodes(data.orders).map((order: any) => {
+          const result: any = { ...order };
+          if (result.lineItems) {
+            result.lineItems = edgesToNodes(result.lineItems);
+          }
+          return result;
+        });
+        return {
+          orders,
+          pageInfo: data.orders.pageInfo
+        };
+      }
+
+      const orders = edgesToNodes(data.orders).map(formatOrderSummary);
 
       return {
         orders,

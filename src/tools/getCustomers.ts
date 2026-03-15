@@ -42,6 +42,14 @@ const GetCustomersInputSchema = z.object({
       "Example: [\"id\", \"email\"] returns only customer GID and email. " +
       `Available: ${AVAILABLE_CUSTOMER_FIELDS.join(", ")}`,
     ),
+  countOnly: z
+    .boolean()
+    .optional()
+    .describe(
+      "IMPORTANT: Use this to check result set size before fetching data. " +
+      "Returns only { count: N } without any resource data, saving significant context. " +
+      "Recommended before paginating large result sets.",
+    ),
 });
 
 type GetCustomersInput = z.infer<typeof GetCustomersInputSchema>;
@@ -51,7 +59,7 @@ let shopifyClient: GraphQLClient;
 
 const getCustomers = {
   name: "get-customers",
-  description: "Get customers or search by name/email. Supports field selection via 'fields' to reduce response size (e.g. fields: [\"id\", \"email\"] for minimal data).",
+  description: "Get customers or search by name/email. Supports field selection via 'fields' and 'countOnly' to get just the count.",
   schema: GetCustomersInputSchema,
 
   // Add initialize method to set up the GraphQL client
@@ -61,7 +69,20 @@ const getCustomers = {
 
   execute: async (input: GetCustomersInput) => {
     try {
-      const { searchQuery, limit, after, before, sortKey, reverse, fields } = input;
+      const { searchQuery, limit, after, before, sortKey, reverse, fields, countOnly } = input;
+
+      // Count-only mode: return just the count
+      if (countOnly) {
+        const countQuery = `
+          query GetCustomersCount($query: String) {
+            customersCount(query: $query) { count }
+          }
+        `;
+        const countData = (await shopifyClient.request(countQuery, { query: searchQuery })) as {
+          customersCount: { count: number };
+        };
+        return { count: countData.customersCount.count };
+      }
 
       const fieldSelection = buildFieldSelection(CUSTOMER_FIELD_MAP, fields);
 
@@ -96,9 +117,24 @@ const getCustomers = {
         customers: any;
       };
 
-      // When custom fields are specified, return raw nodes
+      // When custom fields are specified, return nodes with connection sub-fields flattened
       if (fields) {
-        const customers = data.customers.edges.map((edge: any) => edge.node);
+        const customers = edgesToNodes(data.customers).map((customer: any) => {
+          const result: any = { ...customer };
+          if (result.addressesV2) {
+            result.addresses = edgesToNodes(result.addressesV2);
+            delete result.addressesV2;
+          }
+          if (result.defaultEmailAddress) {
+            result.email = result.defaultEmailAddress.emailAddress;
+            delete result.defaultEmailAddress;
+          }
+          if (result.defaultPhoneNumber) {
+            result.phone = result.defaultPhoneNumber.phoneNumber;
+            delete result.defaultPhoneNumber;
+          }
+          return result;
+        });
         return {
           customers,
           pageInfo: data.customers.pageInfo

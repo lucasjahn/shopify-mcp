@@ -1,6 +1,6 @@
 import type { GraphQLClient } from "graphql-request";
 import { z } from "zod";
-import { handleToolError, buildFieldSelection } from "../lib/toolUtils.js";
+import { handleToolError, edgesToNodes, buildFieldSelection } from "../lib/toolUtils.js";
 
 /** Map of selectable field names → GraphQL fragments for products */
 const PRODUCT_FIELD_MAP: Record<string, string> = {
@@ -42,6 +42,14 @@ const GetProductsInputSchema = z.object({
       "Example: [\"id\", \"title\"] returns only product GID and title. " +
       `Available: ${AVAILABLE_PRODUCT_FIELDS.join(", ")}`,
     ),
+  countOnly: z
+    .boolean()
+    .optional()
+    .describe(
+      "IMPORTANT: Use this to check result set size before fetching data. " +
+      "Returns only { count: N } without any resource data, saving significant context. " +
+      "Recommended before paginating large result sets.",
+    ),
 });
 
 type GetProductsInput = z.infer<typeof GetProductsInputSchema>;
@@ -51,7 +59,7 @@ let shopifyClient: GraphQLClient;
 
 const getProducts = {
   name: "get-products",
-  description: "Get all products or search by title. Supports field selection via 'fields' to reduce response size (e.g. fields: [\"id\", \"title\"] for minimal data).",
+  description: "Get all products or search by title. Supports field selection via 'fields' and 'countOnly' to get just the count.",
   schema: GetProductsInputSchema,
 
   // Add initialize method to set up the GraphQL client
@@ -61,7 +69,7 @@ const getProducts = {
 
   execute: async (input: GetProductsInput) => {
     try {
-      const { searchTitle, limit, after, before, sortKey, reverse, query: rawQuery, fields } = input;
+      const { searchTitle, limit, after, before, sortKey, reverse, query: rawQuery, fields, countOnly } = input;
 
       // Build query string from convenience filters and raw query
       const queryParts: string[] = [];
@@ -72,6 +80,19 @@ const getProducts = {
         queryParts.push(rawQuery);
       }
       const queryFilter = queryParts.join(" ") || undefined;
+
+      // Count-only mode: return just the count
+      if (countOnly) {
+        const countQuery = `
+          query GetProductsCount($query: String) {
+            productsCount(query: $query) { count }
+          }
+        `;
+        const countData = (await shopifyClient.request(countQuery, { query: queryFilter })) as {
+          productsCount: { count: number };
+        };
+        return { count: countData.productsCount.count };
+      }
 
       const fieldSelection = buildFieldSelection(PRODUCT_FIELD_MAP, fields);
 
@@ -106,9 +127,28 @@ const getProducts = {
         products: any;
       };
 
-      // When custom fields are specified, return raw nodes to avoid formatter errors
+      // When custom fields are specified, flatten connection fields to match default format
       if (fields) {
-        const products = data.products.edges.map((edge: any) => edge.node);
+        const products = data.products.edges.map((edge: any) => {
+          const product: any = { ...edge.node };
+          if (product.variants) {
+            product.variants = edgesToNodes(product.variants);
+          }
+          if (product.media) {
+            product.media = edgesToNodes(product.media);
+          }
+          if (product.priceRangeV2) {
+            product.priceRange = {
+              minPrice: product.priceRangeV2.minVariantPrice,
+              maxPrice: product.priceRangeV2.maxVariantPrice,
+            };
+            delete product.priceRangeV2;
+          }
+          if (product.collections) {
+            product.collections = edgesToNodes(product.collections);
+          }
+          return product;
+        });
         return {
           products,
           pageInfo: data.products.pageInfo
